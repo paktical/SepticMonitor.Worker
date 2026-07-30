@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# SQLite database (local runtime data, including WAL/SHM sidecars)
+septic-monitor.db
+septic-monitor.db-shm
+septic-monitor.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Local-only configuration (keep secrets and machine-specific settings out of the repo)
+appsettings.Local.json
+appsettings.*.Local.json
+
+# Logs
+*.log
