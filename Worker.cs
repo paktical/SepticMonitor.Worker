@@ -3,26 +3,33 @@ using MQTTnet.Protocol;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace SepticMonitor.Worker;
 
 public class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
-
-    // --- match your broker + ESP32 ---
-    private const string BrokerHost = "localhost";   // broker runs on this same PC
-    private const int    BrokerPort = 1883;
-    private const string TopicFilter = "septic/#";
-    private const string TopicAlert  = "septic/hp80/alert";
-    // ---------------------------------
+    private readonly MqttOptions _mqtt;
+    private readonly DeviceOptions _device;
+    private readonly MonitorOptions _monitorOptions;
+    private readonly IDbContextFactory<MonitorDbContext> _dbFactory;
 
     private IMqttClient? _mqttClient;
     private PumpMonitor? _monitor;
 
-    public Worker(ILogger<Worker> logger)
+    public Worker(
+        ILogger<Worker> logger,
+        IOptions<MqttOptions> mqtt,
+        IOptions<DeviceOptions> device,
+        IOptions<MonitorOptions> monitorOptions,
+        IDbContextFactory<MonitorDbContext> dbFactory)
     {
-        _logger = logger;
+        _logger         = logger;
+        _mqtt           = mqtt.Value;
+        _device         = device.Value;
+        _monitorOptions = monitorOptions.Value;
+        _dbFactory      = dbFactory;
     }
 
     private async Task PublishAlertAsync(string kind, string detail)
@@ -44,7 +51,7 @@ public class Worker : BackgroundService
 
         var alert = new AlertMessage
         {
-            DeviceId     = "hp80-01",
+            DeviceId     = _device.Id,
             Kind         = kind,
             Detail       = detail,
             Severity     = severity,
@@ -54,25 +61,25 @@ public class Worker : BackgroundService
         var json = JsonSerializer.Serialize(alert);
 
         var msg = new MqttApplicationMessageBuilder()
-            .WithTopic(TopicAlert)
+            .WithTopic(_mqtt.AlertTopic)
             .WithPayload(json)
             .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce) // QoS 1 - don't lose alerts
-            .WithRetainFlag(true)   // last alert stays available for late subscribers
+            .WithRetainFlag(_mqtt.RetainAlerts)   // last alert stays available for late subscribers
             .Build();
 
         await _mqttClient.PublishAsync(msg);
-        _logger.LogInformation("Alert published to {Topic}: {Json}", TopicAlert, json);
+        _logger.LogInformation("Alert published to {Topic}: {Json}", _mqtt.AlertTopic, json);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
- using (var db = new MonitorDbContext())
+        using (var db = await _dbFactory.CreateDbContextAsync(stoppingToken))
         {
-            db.Database.EnsureCreated();
+            await db.Database.EnsureCreatedAsync(stoppingToken);
             _logger.LogInformation("Database ready.");
         }
 
-        _monitor = new PumpMonitor(_logger);
+        _monitor = new PumpMonitor(_logger, _monitorOptions);
         _monitor.OnStateEvent += async (kind, detail) =>
         {
             // Announce the alert over MQTT (headless-friendly, decoupled)
@@ -88,11 +95,11 @@ public class Worker : BackgroundService
             // Persist the event
             try
             {
-                using var db = new MonitorDbContext();
+                using var db = _dbFactory.CreateDbContext();
                 db.Events.Add(new Event
                 {
                     OccurredUtc = DateTime.UtcNow,
-                    DeviceId    = "hp80-01",
+                    DeviceId    = _device.Id,
                     Kind        = kind,
                     Detail      = detail
                 });
@@ -144,7 +151,7 @@ public class Worker : BackgroundService
 
 try
                     {
-                        using var db = new MonitorDbContext();
+                        using var db = _dbFactory.CreateDbContext();
                         db.Readings.Add(new Reading
                         {
                             ReceivedUtc   = DateTime.UtcNow,
@@ -176,40 +183,48 @@ try
             return Task.CompletedTask;
         };
 
-        var options = new MqttClientOptionsBuilder()
-            .WithTcpServer(BrokerHost, BrokerPort)
-            .WithClientId("septic-worker")
-            .Build();
+        var optionsBuilder = new MqttClientOptionsBuilder()
+            .WithTcpServer(_mqtt.Host, _mqtt.Port)
+            .WithClientId(_mqtt.ClientId);
+
+        // Only send credentials if the broker actually requires them.
+        if (!string.IsNullOrWhiteSpace(_mqtt.Username))
+            optionsBuilder = optionsBuilder.WithCredentials(_mqtt.Username, _mqtt.Password ?? "");
+
+        var options = optionsBuilder.Build();
+
+        var reconnectDelay = TimeSpan.FromSeconds(_mqtt.ReconnectDelaySeconds);
 
         // Connect (retry loop in case the broker isn't up yet)
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                _logger.LogInformation("Connecting to broker {Host}:{Port}...", BrokerHost, BrokerPort);
+                _logger.LogInformation("Connecting to broker {Host}:{Port}...", _mqtt.Host, _mqtt.Port);
                 await _mqttClient.ConnectAsync(options, stoppingToken);
 
                 await _mqttClient.SubscribeAsync(
                     new MqttClientSubscribeOptionsBuilder()
-                        .WithTopicFilter(TopicFilter)
+                        .WithTopicFilter(_mqtt.TopicFilter)
                         .Build(),
                     stoppingToken);
 
-                _logger.LogInformation("Connected and subscribed to {Filter}", TopicFilter);
+                _logger.LogInformation("Connected and subscribed to {Filter}", _mqtt.TopicFilter);
                 break;
             }
             catch (Exception ex)
             {
-                _logger.LogError("Connect failed: {Message}. Retrying in 3s.", ex.Message);
-                await Task.Delay(3000, stoppingToken);
+                _logger.LogError("Connect failed: {Message}. Retrying in {Delay}s.",
+                    ex.Message, _mqtt.ReconnectDelaySeconds);
+                await Task.Delay(reconnectDelay, stoppingToken);
             }
         }
 
         // Keep the service alive; messages arrive via the event handler above
         while (!stoppingToken.IsCancellationRequested)
         {
-             _monitor?.CheckOffline();
-            await Task.Delay(1000, stoppingToken);
+            _monitor?.CheckOffline();
+            await Task.Delay(_monitorOptions.PollInterval, stoppingToken);
         }
     }
 }

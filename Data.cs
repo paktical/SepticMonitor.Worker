@@ -28,12 +28,9 @@ public class Event
 
 public class MonitorDbContext : DbContext
 {
+    // Connection string comes from configuration (ConnectionStrings:MonitorDb).
+    public MonitorDbContext(DbContextOptions<MonitorDbContext> options) : base(options) { }
+
     public DbSet<Reading> Readings => Set<Reading>();
     public DbSet<Event> Events => Set<Event>();
-
-    protected override void OnConfiguring(DbContextOptionsBuilder options)
-    {
-        // Database file lives next to the app
-        options.UseSqlite("Data Source=septic-monitor.db");
-    }
 }

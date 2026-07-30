@@ -12,16 +12,20 @@ public class PumpMonitor
 {
     private readonly ILogger _logger;
 
-    // --- tunables ---
-    private readonly TimeSpan _failGrace = TimeSpan.FromSeconds(5);
-    private readonly TimeSpan _offlineGrace = TimeSpan.FromSeconds(30);  // silent this long = offline
-    // ----------------
+    // Grace periods come from configuration (the "Monitor" section).
+    private readonly TimeSpan _failGrace;
+    private readonly TimeSpan _offlineGrace;   // silent this long = offline
 
     private PumpHealth _health = PumpHealth.Unknown;
     private DateTime _lastMessageUtc = DateTime.MinValue;
     private DateTime? _stoppedSinceUtc = null;   // when the pump first went STOPPED
 
-    public PumpMonitor(ILogger logger) => _logger = logger;
+    public PumpMonitor(ILogger logger, MonitorOptions options)
+    {
+        _logger       = logger;
+        _failGrace    = options.FailGrace;
+        _offlineGrace = options.OfflineGrace;
+    }
 
     // Fired whenever a notable state transition occurs
     public event Action<string, string>? OnStateEvent;   // (kind, detail)
